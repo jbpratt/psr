@@ -5,7 +5,6 @@ go 1.22.4
 require (
 	cloud.google.com/go/storage v1.31.0
 	github.com/GoogleCloudPlatform/testgrid v0.0.173
-	github.com/davecgh/go-spew v1.1.1
 	golang.org/x/sync v0.7.0
 	google.golang.org/api v0.134.0
 )
@@ -34,5 +33,5 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20230731193218-e0aa005b6bdf // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20230731193218-e0aa005b6bdf // indirect
 	google.golang.org/grpc v1.57.0 // indirect
-	google.golang.org/protobuf v1.31.0 // indirect
+	google.golang.org/protobuf v1.33.0 // indirect
 )
