@@ -2,27 +2,30 @@ package main
 
 import (
 	"bytes"
-	"cloud.google.com/go/storage"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	"cloud.google.com/go/storage"
+
 	"github.com/GoogleCloudPlatform/testgrid/metadata"
 	"github.com/GoogleCloudPlatform/testgrid/metadata/junit"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
-	"io"
-	"net/http"
-	"os"
-	"strings"
-	"sync"
 )
 
 var (
 	jobVersions = []string{"4.13", "4.14", "4.15", "4.16"}
 	jobNames    = []string{"rosa-classic-sts", "osd-aws", "osd-gcp"}
-	//jobs        = make([]job, 0, len(jobNames))
 )
 
 const (
@@ -41,9 +44,13 @@ type suiteResult struct {
 	ErrorMessages string
 }
 
-type jobResult struct {
-	JobName      string
-	SuitesResult []*suiteResult
+type job struct {
+	name     string
+	id       string
+	version  string
+	duration time.Duration
+	passed   bool
+	results  []*suiteResult
 }
 
 type jobMonitoring struct {
@@ -67,7 +74,7 @@ func sendSlackNotification(webhook string, summary, errors string) error {
 
 	jsonDataMessage, err := json.Marshal(message)
 	if err != nil {
-		return fmt.Errorf("Error marshalling summary to JSON: %v\n", err)
+		return fmt.Errorf("error marshalling summary to JSON: %w", err)
 	}
 
 	resp, err := http.Post(webhook, "application/json; charset=utf-8", bytes.NewBuffer(jsonDataMessage))
@@ -82,41 +89,42 @@ func sendSlackNotification(webhook string, summary, errors string) error {
 }
 
 func processJobResults(suites *junit.Suites) []*suiteResult {
-	var _suitesResult []*suiteResult
+	var suitesResults []*suiteResult
 	for _, suite := range suites.Suites {
-		_suiteResult := new(suiteResult)
-		_suiteResult.Name = suite.Name
-		_suiteResult.Tests = suite.Tests
+		suiteResult := new(suiteResult)
+		suiteResult.Name = suite.Name
+		suiteResult.Tests = suite.Tests
 		for _, result := range suite.Results {
 			switch result.Status {
 			case "passed":
-				_suiteResult.Passed++
+				suiteResult.Passed++
 			case "failed":
-				_suiteResult.Failed++
-				_suiteResult.ErrorMessages += fmt.Sprintf("Test Failed: %s\n: %s\n", result.Name, result.Failure.Value)
+				suiteResult.Failed++
+				suiteResult.ErrorMessages += fmt.Sprintf("Test Failed: %s\n: %s\n", result.Name, result.Failure.Value)
 			case "skipped":
-				_suiteResult.Skipped++
+				suiteResult.Skipped++
 			case "pending":
-				_suiteResult.Pending++
+				suiteResult.Pending++
 			case "":
 				if result.Failure == nil {
-					_suiteResult.Passed++
+					suiteResult.Passed++
 				} else {
-					_suiteResult.Failed++
-					_suiteResult.ErrorMessages += fmt.Sprintf("Test Failed: %s\nFailure: %s\n", result.Name, result.Failure.Value)
+					suiteResult.Failed++
+					suiteResult.ErrorMessages += fmt.Sprintf("Test Failed: %s\nFailure: %s\n", result.Name, result.Failure.Value)
 				}
 			}
 		}
-		_suitesResult = append(_suitesResult, _suiteResult)
+		suitesResults = append(suitesResults, suiteResult)
 	}
-	return _suitesResult
+	return suitesResults
 }
 
-func processJobXMLs(ctx context.Context, bucket *storage.BucketHandle, jobName, jobID string) (*jobResult, error) {
+func processJobXMLs(ctx context.Context, bucket *storage.BucketHandle, jobName, jobID string) ([]*suiteResult, error) {
 	objectIter := bucket.
 		Objects(ctx, &storage.Query{MatchGlob: "**/*.xml", Prefix: fmt.Sprintf("logs/%s/%s/", jobName, jobID)})
-	_jobResult := new(jobResult)
-	_jobResult.JobName = jobName
+
+	jobResults := make([]*suiteResult, 0)
+
 	for {
 		object, err := objectIter.Next()
 		if errors.Is(err, iterator.Done) {
@@ -133,12 +141,14 @@ func processJobXMLs(ctx context.Context, bucket *storage.BucketHandle, jobName, 
 			return nil, err
 		}
 		_ = objectReader.Close()
-		_jobResult.SuitesResult = append(_jobResult.SuitesResult, processJobResults(suites)...)
+
+		jobResults = append(jobResults, processJobResults(suites)...)
 	}
-	return _jobResult, nil
+
+	return jobResults, nil
 }
 
-func processJob(ctx context.Context, bucket *storage.BucketHandle, name string, logCh chan<- *jobResult) error {
+func processJob(ctx context.Context, bucket *storage.BucketHandle, name string, jobsChan chan<- *job) error {
 	basePath := fmt.Sprintf("logs/%s", name)
 
 	objReader, err := bucket.Object(basePath + "/latest-build.txt").NewReader(ctx)
@@ -150,16 +160,20 @@ func processJob(ctx context.Context, bucket *storage.BucketHandle, name string, 
 	if err != nil {
 		return err
 	}
-	jobID := string(latestBuildBytes)
 
-	basePath += fmt.Sprintf("/%s", jobID)
+	job := &job{
+		name: name,
+		id:   string(latestBuildBytes),
+	}
+
+	basePath += fmt.Sprintf("/%s", job.id)
 
 	var started metadata.Started
 	var finished metadata.Finished
 
 	objReader, err = bucket.Object(basePath + "/started.json").NewReader(ctx)
 	if err != nil {
-		return fmt.Errorf("fetch started.json for %s/%s: %w", name, jobID, err)
+		return fmt.Errorf("fetch started.json for %s/%s: %w", name, job.id, err)
 	}
 	if err = json.NewDecoder(objReader).Decode(&started); err != nil {
 		return err
@@ -168,38 +182,33 @@ func processJob(ctx context.Context, bucket *storage.BucketHandle, name string, 
 	objReader, err = bucket.Object(basePath + "/finished.json").NewReader(ctx)
 	if err != nil {
 		if errors.Is(err, storage.ErrObjectNotExist) {
-			fmt.Printf("WARNING: job %s/%s finished.json not found, assuming job in-progress and skipping..\n", name, jobID)
+			fmt.Printf("WARNING: job %s/%s finished.json not found, assuming job in-progress and skipping..\n", name, job.id)
+			jobsChan <- job
 			return nil
 		}
-		return fmt.Errorf("fetch finished.json for %s/%s: %w", name, jobID, err)
+		return fmt.Errorf("fetch finished.json for %s/%s: %w", name, job.id, err)
 	}
 	if err = json.NewDecoder(objReader).Decode(&finished); err != nil {
 		return err
 	}
-	var _jobResult *jobResult
-	_jobResult, err = processJobXMLs(ctx, bucket, name, jobID)
+
+	job.duration = time.Duration(*finished.Timestamp-started.Timestamp) * time.Second
+
+	job.results, err = processJobXMLs(ctx, bucket, name, job.id)
 	if err != nil {
 		return err
 	}
-	if _jobResult != nil {
-		logCh <- _jobResult
-	}
-	//duration := time.Duration(*finished.Timestamp-started.Timestamp) * time.Second
-	//jobs = append(jobs, job{
-	//	name:     name,
-	//	id:       jobID,
-	//	passed:   *finished.Passed,
-	//	duration: duration.String(),
-	//	// suites:   suites,
-	//})
+
+	jobsChan <- job
+
 	return nil
 }
 
-func extractSummaryAndErrorsFromJobResult(result *jobResult) (string, string) {
+func extractSummaryAndErrorsFromJobResult(job *job) (string, string) {
 	var summaryBuilder strings.Builder
 	var errorBuilder strings.Builder
-	summaryBuilder.WriteString(fmt.Sprintf("Job: %s\n", result.JobName))
-	for _, suite := range result.SuitesResult {
+	summaryBuilder.WriteString(fmt.Sprintf("Job: %s\n", job.name))
+	for _, suite := range job.results {
 		summaryBuilder.WriteString(fmt.Sprintf("\tsuite: %s %d %d %d %d %d\n", suite.Name, suite.Tests, suite.Passed, suite.Failed, suite.Skipped, suite.Pending))
 		errorBuilder.WriteString(suite.ErrorMessages)
 	}
@@ -215,53 +224,41 @@ func main() {
 		panic(err)
 	}
 	bucket := client.Bucket(bucketName)
-	jobsSize := len(jobNames) * len(jobVersions)
-	jobResultChannel := make(chan *jobResult, jobsSize)
-	var wg sync.WaitGroup
 
-	// Goroutine to collect logs
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		var statsSummaryBuilder strings.Builder
-		var errorBuilder strings.Builder
-		for _jobResult := range jobResultChannel {
-			statsSummary, errorMessages := extractSummaryAndErrorsFromJobResult(_jobResult)
-			statsSummaryBuilder.WriteString(statsSummary)
-			errorBuilder.WriteString(errorMessages)
-		}
-		webhook := os.Getenv("WEBHOOK")
-		err = sendSlackNotification(webhook, statsSummaryBuilder.String(), errorBuilder.String())
-		if err != nil {
-			panic(err)
-		}
-	}()
+	jobsSize := len(jobNames) * len(jobVersions)
+	jobsChan := make(chan *job, jobsSize)
+	jobs := make([]*job, 0, jobsSize)
 
 	for _, jobName := range jobNames {
 		for _, jobVersion := range jobVersions {
 			name := fmt.Sprintf(jobPrefix+jobName, jobVersion)
-			eg.Go(func() error { return processJob(ctx, bucket, name, jobResultChannel) })
+			eg.Go(func() error { return processJob(ctx, bucket, name, jobsChan) })
 		}
 	}
 
 	if err := eg.Wait(); err != nil {
 		panic(err)
 	}
-	close(jobResultChannel)
-	wg.Wait()
 
-	//sort.Slice(jobs, func(i, j int) bool {
-	//	return jobs[i].name < jobs[j].name
-	//})
-	//
-	//fmt.Println()
-	//
-	//w := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
-	//fmt.Fprintln(w, "name\tid\tduration\tpassed")
-	//for _, job := range jobs {
-	//	fmt.Fprintf(w, "%s\t%s\t%s\t%t\n", job.name, job.id, job.duration, job.passed)
-	//}
-	//if err := w.Flush(); err != nil {
-	//	panic(err)
-	//}
+	for range jobsSize {
+		job := <-jobsChan
+		jobs = append(jobs, job)
+	}
+
+	sort.Slice(jobs, func(i, j int) bool {
+		return jobs[i].name < jobs[j].name
+	})
+
+	tw := tabwriter.NewWriter(os.Stdout, 1, 1, 1, ' ', 0)
+	fmt.Fprintln(tw, "name\tid\tduration\tpassed")
+
+	for _, job := range jobs {
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%t\n", job.name, job.id, job.duration, job.passed)
+
+		// send slack message
+	}
+
+	if err := tw.Flush(); err != nil {
+		panic(err)
+	}
 }
